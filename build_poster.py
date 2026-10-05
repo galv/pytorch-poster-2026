@@ -5,6 +5,7 @@ poster.pdf with LibreOffice, and checked with poppler-utils. The only Python
 dependency is pygments.
 """
 
+import argparse
 import ast
 import re
 import shutil
@@ -23,6 +24,8 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 EXAMPLES = HERE / "examples.py"
 TEMPLATE = ROOT / "PyTorch Conf NA 2026 Poster Template 36x24_horizontal (1).pptx"
+if not TEMPLATE.exists():
+    TEMPLATE = HERE / "templates" / TEMPLATE.name
 PPTX = HERE / "poster.pptx"
 PDF = HERE / "poster.pdf"
 
@@ -66,47 +69,59 @@ OPEN_WORK = (
 SGD = """
 def safe_sgd(param, grad, lr):
     finite = torch.isfinite(grad).all()
-    return torch.cond(
-        finite,
-        lambda p, g, rate: p - rate * g,
-        lambda p, g, rate: p.clone(),
-        (param, grad, lr),
-    )
+
+    def update():
+        param.sub_(lr * grad)
+
+    torch.cond(finite, update, lambda: None, ())
 """
 
 CAPTURE = """
 step = torch.compile(safe_sgd, backend="cudagraphs")
-updated = step(param, grad, lr)  # replays one graph
+step(param, grad, lr)  # replays one graph
 """
 
 BAG = """
 def embedding_bag(table, ids, n):
-    C = 4
-    i = torch.zeros((), dtype=torch.int64, device=ids.device)
-    acc = table.new_zeros(table.shape[1])
+    caps = (32, 128, 512, 4096)
+    bucket = sum((n > c).to(torch.int32)
+                 for c in caps[:-1])
 
-    def body(i, acc):
-        pos = i + torch.arange(C, device=ids.device)
-        rows = table[ids[pos.clamp_max(len(ids) - 1)]]
-        return i + C, acc + (rows * (pos < n)[:, None]).sum(0)
+    def reduce(cap):
+        pos = torch.arange(cap, device=ids.device)
+        rows = table[ids[:cap]]
+        return (rows * (pos < n)[:, None]).sum(0)
 
-    _, acc = torch.while_loop(
-        lambda i, acc: i < n, body, (i, acc))
-    return acc
+    branches = [lambda c=c: reduce(c) for c in caps]
+    return switch(bucket, branches, ())
 """
 
-IMPORT = """
-from torch._higher_order_ops import switch
+SWITCH_IMPORT = "from torch._higher_order_ops import switch"
+
+MOE_ROUNDS = """
+total_rounds = sync_all_reduce_max(local_rounds)
+def cond(iteration, done, output):
+    return iteration < total_rounds
 """
 
-MOE = """
-def moe_decode(x, router, w_up, w_down):
-    expert = (x @ router).argmax()
-    experts = [
-        lambda x, e=e: torch.relu(x @ w_up[e]) @ w_down[e]
-        for e in range(len(w_up))
-    ]
-    return switch(expert, experts, (x,))
+MOE_GEMM = """
+counts = (
+    (packed_experts[:, None]
+     == local_expert_ids[None, :])
+    & packed_valid[:, None]
+).sum(0)
+offsets = torch.cumsum(counts, 0, dtype=torch.int32)
+packed_output = torch.nn.functional.grouped_mm(
+    packed_tokens,
+    local_weights.transpose(-2, -1),
+    offs=offsets,
+)
+"""
+
+MOE_LOOP = """
+iteration, _, output = torch.while_loop(
+    cond, body, (iteration, done, output))
+return output, iteration
 """
 
 
@@ -116,16 +131,22 @@ def verify_code():
     functions = {
         node.name: node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef)
     }
-    for snippet in (SGD, BAG, MOE):
+    for snippet in (SGD, BAG):
         shown = ast.parse(snippet).body[0]
         if ast.dump(shown) != ast.dump(functions[shown.name]):
             raise ValueError(f"Poster code differs from examples.py: {shown.name}")
     lines = {line.strip() for line in source.splitlines()}
-    for snippet in (CAPTURE, IMPORT):
+    for snippet in (CAPTURE, SWITCH_IMPORT):
         for line in snippet.strip().splitlines():
             if line.split("#")[0].strip() not in lines:
                 raise ValueError(f"Poster line is not in examples.py: {line}")
-    print("Displayed code matches examples.py.")
+    original = ast.parse((HERE / "ep8_moe_backpressure.py").read_text())
+    original_nodes = {ast.dump(node) for node in ast.walk(original)}
+    for snippet in (MOE_ROUNDS, MOE_GEMM, MOE_LOOP):
+        for node in ast.parse(snippet).body:
+            if ast.dump(node) not in original_nodes:
+                raise ValueError("Displayed MoE excerpt differs from original source")
+    print("Displayed code matches examples.py and original ep8_moe_backpressure.py.")
 
 
 def emu(points):
@@ -209,13 +230,13 @@ class Slide:
             for runs in paragraphs
         )
 
-    def textbox(self, name, x, top, width, height, paragraphs, size, leading=None, align="l", anchor="t"):
-        """Non-wrapping text box with zero insets; paragraphs are lists of runs."""
+    def textbox(self, name, x, top, width, height, paragraphs, size, leading=None, align="l", anchor="t", wrap="none"):
+        """Text box with zero insets and optional word wrapping."""
         self.shapes.append(
             f'<p:sp><p:nvSpPr><p:cNvPr id="{self.next_id()}" name="{escape(name)}"/>'
             f'<p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr>{xfrm(x, top, width, height)}'
             '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></p:spPr>'
-            f'<p:txBody><a:bodyPr wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="{anchor}">'
+            f'<p:txBody><a:bodyPr wrap="{wrap}" lIns="0" tIns="0" rIns="0" bIns="0" anchor="{anchor}">'
             f"<a:noAutofit/></a:bodyPr><a:lstStyle/>{self.paragraphs_xml(paragraphs, size, leading, align)}"
             "</p:txBody></p:sp>"
         )
@@ -282,6 +303,15 @@ class Slide:
         x, top = cx - size / 2, cy - size / 2
         points = [(0.1 * size, 0.55 * size), (0.4 * size, 0.85 * size), (0.92 * size, 0.18 * size)]
         self.path("Tick", x, top, size, size, [points], line=GREEN, line_width=0.15 * size, closed=False)
+
+    def cross(self, cx, cy, size=30):
+        x, top = cx - size / 2, cy - size / 2
+        strokes = [
+            [(0.2 * size, 0.2 * size), (0.8 * size, 0.8 * size)],
+            [(0.2 * size, 0.8 * size), (0.8 * size, 0.2 * size)],
+        ]
+        self.path("Unsupported X", x, top, size, size, strokes,
+                  line="C62828", line_width=0.15 * size, closed=False)
 
     def barrier(self, cx, cy, size=30):
         """Construction barrier: striped board on two legs."""
@@ -419,7 +449,7 @@ def support_matrix(s, x, top):
         ("CUDA graph support", "yes", "yes", "wip"),
         ("In-place input mutation*", "yes", "yes", "yes"),
         ("Minimum CUDA", "12.4", "12.4", "12.8"),
-        ("Inductor backend", "yes", "yes", "yes"),
+        ("Inductor backend", "no", "no", "no"),
     )
     for j, (op, node) in enumerate(ops):
         left = x + label_width + j * cell
@@ -435,6 +465,8 @@ def support_matrix(s, x, top):
             cx, cy = x + label_width + (j + 0.5) * cell, row_top + row / 2
             if value == "yes":
                 s.tick(cx, cy, 36)
+            elif value == "no":
+                s.cross(cx, cy, 36)
             elif value == "wip":
                 s.barrier(cx, cy, 34)
             else:
@@ -451,7 +483,7 @@ def support_matrix(s, x, top):
         left += 320
     if "wip" in used:
         s.barrier(left + 18, legend + 12, 26)
-        s.text("Legend open", left + 48, legend, "open PR, or not yet supported", 20, x + COL - left - 48)
+        s.text("Legend open", left + 48, legend, "PR open, not yet merged", 20, x + COL - left - 48)
     notes = (
         "* Inputs mutated in place under torch.no_grad() or torch.inference_mode().",
         "switch is torch._higher_order_ops.switch; CUDA graph capture needs #189461.",
@@ -475,33 +507,31 @@ def cond_graph(s, x, top):
     frame_top, frame_height = top + 168, 252
     s.container("IF/ELSE node", x + 8, frame_top, COL - 16, frame_height, "IF / ELSE conditional node", "handle = finite")
     body_width = (COL - 16 - 3 * 18) / 2
-    for k, (label, kernel) in enumerate((("body 0: runs if finite", "out = p - rate * g"), ("body 1: runs otherwise", "out.copy_(p.clone())"))):
+    for k, (label, kernel) in enumerate((("child graph 0: runs if finite", "param.sub_(lr * grad)"), ("child graph 1: runs otherwise", "no-op"))):
         left = x + 8 + 18 + k * (body_width + 18)
         s.node(f"Body {k}", left, frame_top + 58, body_width, 172, "", 0, WHITE, KERNEL_LINE, 1.25, 6)
         s.text(f"Body {k} label", left + 16, frame_top + 72, label, 19, body_width - 32, bold=True)
         s.node(f"Body {k} kernel", left + 16, frame_top + 120, body_width - 32, 56, kernel, 19)
-        s.text(f"Body {k} note", left + 16, frame_top + 190, "branch kernels" if k == 0 else "copy into the same out", 17, body_width - 32, color=MUTED)
+        s.text(f"Body {k} note", left + 16, frame_top + 190, "update param in place" if k == 0 else "leave param unchanged", 17, body_width - 32, color=MUTED)
     s.arrow(center, frame_top + frame_height, center, frame_top + frame_height + 30)
-    s.node("Output", center - 300, frame_top + frame_height + 30, 600, 54, "out: one fixed buffer  →  next kernels", 20, font=SANS)
+    s.node("Parameter buffer", center - 300, frame_top + frame_height + 30, 600, 54, "param: same buffer  →  next kernels", 20, font=SANS)
 
 
-def while_graph(s, x, top):
-    s.container("WHILE node", x + 8, top, COL - 16, 176, "WHILE conditional node", "handle = i < n")
-    widths = (236, 206, 236)
-    labels = ("rows = table[ids[pos]]", "acc += masked sum", "i += C; set handle")
-    left = x + 30
-    centers = []
-    for k, (width, label) in enumerate(zip(widths, labels)):
-        s.node(f"WHILE kernel {k}", left, top + 56, width, 52, label, 17 if k == 0 else 18, font=MONO if k == 0 else SANS)
-        centers.append(left + width / 2)
-        if k < 2:
-            s.arrow(left + width, top + 82, left + width + 28, top + 82)
-        left += width + 28
-    loop = top + 138
-    s.arrow(centers[2], top + 108, centers[2], loop, head=False)
-    s.arrow(centers[2], loop, centers[0], loop, head=False)
-    s.arrow(centers[0], loop, centers[0], top + 108)
-    s.text("WHILE loop label", centers[0] + 30, loop + 6, "repeat while i < n: the GPU decides", 17, centers[2] - centers[0] - 60, "ctr", color=MUTED)
+def bucket_graph(s, x, top):
+    s.container("Embedding SWITCH", x + 8, top, COL - 16, 126,
+                "SWITCH: token-count bucket", "n = 80")
+    gap = 12
+    cell = (COL - 16 - 36 - 3 * gap) / 4
+    for i, cap in enumerate((32, 128, 512, 4096)):
+        left = x + 26 + i * (cell + gap)
+        selected = cap == 128
+        s.node(f"Embedding bucket {cap}", left, top + 51, cell, 44,
+               f"{cap} tokens", 20, ORANGE if selected else WHITE,
+               ORANGE if selected else KERNEL_LINE, font=SANS,
+               color=WHITE if selected else MUTED, bold=selected)
+    s.text("Embedding bucket result", x + 26, top + 101,
+           "Every branch returns [D]; 80 tokens use the 128-token branch.",
+           18, COL - 52, "ctr", color=MUTED)
 
 
 def switch_graph(s, x, top):
@@ -527,22 +557,44 @@ def build_slide():
     s.title()
     width = WIDTH - 2 * MARGIN
     lead = [
-        s.run("GPU decisions. Fixed buffer shapes.   ", 25, bold=True, color=TEAL),
-        s.run("Write control flow with torch.cond, torch.while_loop, or torch.switch; PyTorch captures it as CUDA graph conditional nodes.", 25),
+        s.run("Write control flow with torch.cond(), torch.while_loop(), or torch.switch(); PyTorch captures it as CUDA graph conditional nodes automatically.", 25),
     ]
     s.text("Lead", MARGIN, 266, lead, 25, width)
 
-    # Row 1: support matrix, a torch.cond example, and the CUDA graph it becomes.
+    # Row 1: past/present context, torch.cond, and its captured graph.
     row1, content1 = 318, 404
-    s.heading(XS[0], row1, "", "Support matrix", "Control-flow ops and the CUDA graph node each lowers to")
-    support_matrix(s, XS[0], content1)
+    past = (
+        "CUDA graphs could not capture any data-dependent control flow in PyTorch "
+        "because that involved synchronizing with the host. Though CUDA graph "
+        "conditional nodes can run data-dependent control flow fully on the GPU, "
+        "they were not yet expressible via PyTorch. Users had to split their "
+        "workload into multiple CUDA graphs, which is intrusive and hard to maintain."
+    )
+    present = (
+        "Control flow expressed with torch.cond(), torch.while_loop(), or "
+        "torch.switch() can now be lowered to a CUDA graph. Outputs must keep "
+        "a fixed shape across branches and loop iterations. Within that constraint, "
+        "data-dependent control flow is useful for real workloads, as the examples "
+        "here demonstrate."
+    )
+    for name, top, height, value, color in (
+        ("Past", row1, 310, past, MUTED),
+        ("Present", row1 + 336, 278, present, TEAL),
+    ):
+        paragraphs = [
+            [s.run(name, 30, bold=True, color=color)],
+            [s.run(value, 25)],
+        ]
+        s.textbox(name, XS[0], top, COL, height, paragraphs, 25,
+                  leading=34, wrap="square")
+        s.boxes.append((name, XS[0], top, XS[0] + COL, top + height))
 
-    s.heading(XS[1], row1, "01", "Skip non-finite optimizer steps", "torch.cond()  →  IF/ELSE conditional node")
+    s.heading(XS[1], row1, "01", "Skip optimizer if gradient is non-finite", "torch.cond()  →  IF/ELSE conditional node")
     bottom = s.code("Code: safe_sgd", SGD, XS[1], content1, 23, 30)
     s.text("Capture label", XS[1], bottom + 26, "Capture once, then replay:", 21, bold=True)
     bottom = s.code("Code: capture", CAPTURE, XS[1], bottom + 62, 21, 27)
     s.text("Note: cond 1", XS[1], bottom + 28, "The predicate never leaves the GPU: no .item(), no CPU sync.", 21)
-    s.text("Note: cond 2", XS[1], bottom + 60, "The same graph takes or skips the update on every replay.", 21)
+    s.text("Note: cond 2", XS[1], bottom + 60, "The same graph updates param or leaves it unchanged on each replay.", 21)
     s.text("Note: cond 3", XS[1], bottom + 92, "Before: a Python if on this flag forces a CPU sync and breaks capture.", 21, color=MUTED)
 
     s.heading(XS[2], row1, "", "The captured CUDA graph", "What safe_sgd becomes: one graph, GPU-side branch")
@@ -552,41 +604,40 @@ def build_slide():
         s.rect("Divider", x - GAP / 2, row1, 1, 932 - row1, RULE)
     s.rule(MARGIN, 952, width, TEAL, 2)
 
-    # Row 2: torch.while_loop and torch.switch examples, then the contract and open work.
+    # Row 2: support matrix, embedding bags, and lossless distributed MoE.
     row2, content2 = 972, 1058
-    s.heading(XS[0], row2, "02", "Runtime-sized embedding bags", "torch.while_loop()  →  WHILE conditional node")
-    bottom = s.code("Code: embedding_bag", BAG, XS[0], content2, 21, 26)
-    while_graph(s, XS[0], bottom + 26)
-    s.text("Note: while", XS[0], bottom + 222, "n changes per replay; acc keeps its shape and address.", 21)
+    s.heading(XS[0], row2, "", "Support matrix", "Control-flow ops and the CUDA graph node each lowers to")
+    support_matrix(s, XS[0], content2)
 
-    s.heading(XS[1], row2, "03", "Top-1 MoE: run only the routed expert", "torch.switch()  →  SWITCH conditional node")
-    s.text("Import: switch", XS[1], content2, IMPORT.strip(), 19, font=MONO, color=MUTED)
-    bottom = s.code("Code: moe_decode", MOE, XS[1], content2 + 36, 22, 27)
-    switch_graph(s, XS[1], bottom + 26)
-    s.text("Note: switch 1", XS[1], bottom + 312, "Only the routed expert's kernels run and only its weights are read.", 21)
-    s.text("Note: switch 2", XS[1], bottom + 344, "Capture needs #189461; today the example runs eagerly / aot_eager.", 19, color=MUTED)
-
-    s.heading(XS[2], row2, "", "The contract", "What keeps a region inside one CUDA graph")
-    bottom = s.bullets(
-        XS[2],
-        content2,
-        (
-            ("Static output shapes.", "Every branch and loop iteration returns", "tensors of the same shape, dtype, and device."),
-            ("Decisions stay on the GPU.", "Predicates, loop guards, and switch", "indices are CUDA tensors; replay never calls .item()."),
-            ("Bounded dynamism.", "A runtime size becomes a GPU scalar plus a", "fixed-capacity buffer, as in the chunked while_loop."),
-            ("One line to adopt.", 'torch.compile(fn, backend="cudagraphs")', "captures once and replays; no manual capture code."),
-            ("Scales out (prototype).", "EP=8 all-to-all MoE inside torch.while_loop", "on 8 H100s with zero dropped tokens."),
-        ),
+    s.heading(XS[1], row2, "02", "Embedding bags without maximum padding",
+              "torch.switch()  →  SWITCH conditional node")
+    x = XS[1]
+    motivation = (
+        "Recommender system requests vary widely in token count, but each embedding "
+        "bag returns a fixed-width vector. Select a token-count bucket on the GPU "
+        "and pad only to that bucket's capacity."
     )
+    s.textbox("Embedding motivation", x, content2, COL, 100,
+              [[s.run(motivation, 23)]], 23, leading=29, wrap="square")
+    s.boxes.append(("Embedding motivation", x, content2, x + COL, content2 + 100))
+    s.text("Import: embedding switch", x, content2 + 110, SWITCH_IMPORT, 18, font=MONO, color=MUTED)
+    bottom = s.code("Code: embedding_bag", BAG, x, content2 + 146, 20, 24)
+    bucket_graph(s, x, bottom + 20)
+    s.text("Embedding input contract", x, bottom + 158,
+           "ids: fixed 4,096-slot buffer; 0 ≤ n ≤ 4,096; output: [D].", 20, color=MUTED)
 
-    top = bottom + 6
-    s.rule(XS[2], top, COL)
-    s.text("Open work heading", XS[2], top + 16, "Work Before General Use", 27, color=ORANGE, bold=True)
-    s.text("Open work lead", XS[2], top + 56, "Prototype; these upstream items are still open:", 20)
-    for index, (label, url, description) in enumerate(OPEN_WORK):
-        runs = [s.run(label, 20, color=BLUE, bold=True, url=url), s.run("  " + description, 20)]
-        s.text(f"Open work {index + 1}", XS[2], top + 92 + index * 30, runs, 20)
-    s.text("Open work inductor", XS[2], top + 92 + len(OPEN_WORK) * 30, "Not yet: conditional nodes generated by Inductor.", 20, color=MUTED)
+    s.heading(XS[2], row2, "03", "Lossless MoE routing with software backpressure",
+              "ep8_moe: torch.while_loop() + grouped_mm()")
+    x = XS[2]
+    s.text("MoE capacity", x, content2, "EP=8; 4,096 tokens/rank; 512 slots/source; zero tokens dropped.", 20)
+    s.text("MoE rounds heading", x, content2 + 36, "1. All ranks agree on the number of rounds", 21, bold=True)
+    bottom = s.code("Code: MoE rounds", MOE_ROUNDS, x, content2 + 68, 19, 23)
+    s.text("MoE GEMM heading", x, bottom + 20, "2. Group packed tokens by expert; run grouped GEMM", 21, bold=True)
+    bottom = s.code("Code: MoE grouped GEMM", MOE_GEMM, x, bottom + 54, 19, 23)
+    s.text("MoE loop heading", x, bottom + 20, "3. Repeat bounded all-to-all rounds on the GPU", 21, bold=True)
+    bottom = s.code("Code: MoE while loop", MOE_LOOP, x, bottom + 54, 19, 23)
+    s.text("MoE excerpt note", x, bottom + 20, "Excerpts: routing, packing, returns, and capture helpers omitted.", 18, color=MUTED)
+
     for x in XS[1:]:
         s.rect("Divider", x - GAP / 2, row2, 1, 1700 - row2, RULE)
     return s
@@ -605,8 +656,9 @@ def write_pptx(slide):
                 # LibreOffice draws hyperlinks in the theme color, ignoring the run color.
                 data = data.replace(b'<a:hlink><a:srgbClr val="CCCCFF"/>', f'<a:hlink><a:srgbClr val="{BLUE}"/>'.encode())
             elif item.filename == "docProps/core.xml":
+                data = re.sub(rb"<dc:title>.*?</dc:title>", b"", data)
                 data = re.sub(
-                    rb"<dc:creator>.*?</dc:creator>",
+                    rb"<dc:creator(?:\s*/>|>.*?</dc:creator>)",
                     f"<dc:title>{escape(TITLE)}</dc:title><dc:creator>{escape(creator)}</dc:creator>".encode(),
                     data,
                 )
@@ -670,21 +722,29 @@ def verify_pdf(slide):
             raise ValueError(f"Highlight is not behind its code line: {line.strip()}")
 
     text = poppler("pdftotext", str(PDF), "-")
-    for required in ("torch.cond", "torch.while_loop", "switch(", TITLE, *(a for author in AUTHORS for a in author)):
+    for required in ("torch.cond", "torch.while_loop", "grouped_mm", "ep8_moe", TITLE, *(a for author in AUTHORS for a in author)):
         if required not in text:
             raise ValueError(f"Missing poster content: {required}")
     links = set(re.findall(rb"/URI\s*\(([^)]*)\)", PDF.read_bytes()))
-    for _, url, _ in OPEN_WORK:
+    for url in slide.links:
         if url.encode() not in links:
             raise ValueError(f"Missing PDF link: {url}")
 
-    poppler("pdftoppm", "-r", "150", "-png", "-singlefile", str(PDF), str(HERE / "poster_150dpi"))
-    poppler("pdftoppm", "-r", "54", "-png", "-singlefile", str(PDF), str(HERE / "poster_preview"))
+    poppler("pdftoppm", "-r", "150", "-png", "-singlefile", str(PDF), str(PDF.with_name(PDF.stem + "_150dpi")))
+    poppler("pdftoppm", "-r", "54", "-png", "-singlefile", str(PDF), str(PDF.with_name(PDF.stem + "_preview")))
     print(f"Verified: 1 page, 36 x 24 inches, embedded fonts, {len(words)} words inside their boxes, links.")
     print(f"PDF: {PDF}")
 
 
 def main():
+    global PPTX, PDF
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-stem", default="poster", help="Output basename, without extension")
+    args = parser.parse_args()
+    if Path(args.output_stem).name != args.output_stem or args.output_stem in ("", ".", ".."):
+        parser.error("--output-stem must be a basename without directories")
+    PPTX = HERE / (args.output_stem + ".pptx")
+    PDF = HERE / (args.output_stem + ".pdf")
     verify_code()
     slide = build_slide()
     write_pptx(slide)
