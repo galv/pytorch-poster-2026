@@ -34,7 +34,7 @@ EXAMPLES_URL = "https://ibm.biz/controlflow-in-cuda-graphs"  # Encoded in QR_COD
 FURTHER_EXAMPLES = (
     ("safe_sgd", "cond", "optimizer skip"),
     ("embedding_bag", "switch", "embedding buckets"),
-    ("moe_decode", "switch", "top-1 MoE"),
+    ("ep8_moe", "while_loop()", "MoE"),
 )
 
 TITLE = "Shape-Stable Dynamic Control Flow in PyTorch CUDA Graphs"
@@ -107,23 +107,25 @@ def embedding_bag(table, ids, n):
 SWITCH_IMPORT = "from torch._higher_order_ops import switch"
 
 MOE_ROUNDS = """
+destinations = routes // LOCAL_EXPERTS
+tokens_per_destination = (
+    destinations[None, :] == peers).sum(1)
+local_rounds = (
+    (tokens_per_destination + PEER_CAPACITY - 1)
+    // PEER_CAPACITY).max()
 total_rounds = sync_all_reduce_max(local_rounds)
 def cond(iteration, done, output):
     return iteration < total_rounds
 """
 
 MOE_GEMM = """
-counts = (
-    (packed_experts[:, None]
-     == local_expert_ids[None, :])
-    & packed_valid[:, None]
-).sum(0)
+counts = ((packed_experts[:, None] ==
+           local_expert_ids[None, :])
+          & packed_valid[:, None]).sum(0)
 offsets = torch.cumsum(counts, 0, dtype=torch.int32)
 packed_output = torch.nn.functional.grouped_mm(
-    packed_tokens,
-    local_weights.transpose(-2, -1),
-    offs=offsets,
-)
+    packed_tokens, local_weights.transpose(-2, -1),
+    offs=offsets)
 """
 
 MOE_LOOP = """
@@ -143,15 +145,16 @@ def verify_code():
         shown = ast.parse(snippet).body[0]
         if ast.dump(shown) != ast.dump(functions[shown.name]):
             raise ValueError(f"Poster code differs from examples.py: {shown.name}")
+    original = ast.parse((HERE / "ep8_moe_backpressure.py").read_text())
+    original_functions = {node.name for node in original.body if isinstance(node, ast.FunctionDef)}
     for name, _, _ in FURTHER_EXAMPLES:
-        if name not in functions:
+        if name not in functions and name not in original_functions:
             raise ValueError(f"Further example is not in examples.py: {name}")
     lines = {line.strip() for line in source.splitlines()}
     for snippet in (CAPTURE, SWITCH_IMPORT):
         for line in snippet.strip().splitlines():
             if line.split("#")[0].strip() not in lines:
                 raise ValueError(f"Poster line is not in examples.py: {line}")
-    original = ast.parse((HERE / "ep8_moe_backpressure.py").read_text())
     original_nodes = {ast.dump(node) for node in ast.walk(original)}
     for snippet in (MOE_ROUNDS, MOE_GEMM, MOE_LOOP):
         for node in ast.parse(snippet).body:
@@ -395,12 +398,12 @@ class Slide:
         self.boxes.append((name, x, top, x + width, top + height + 0.4 * size))
         return top + height
 
-    def heading(self, x, top, number, title, subline):
+    def heading(self, x, top, number, title, subline, subline_size=21):
         runs = [self.run(title, 30, bold=True)]
         if number:
             runs.insert(0, self.run(number + "  ", 30, color=TEAL, bold=True))
         self.text(f"Heading {title}", x, top, runs, 30)
-        self.text(f"Subline {title}", x, top + 42, subline, 21, color=MUTED)
+        self.text(f"Subline {title}", x, top + 42, subline, subline_size, color=MUTED)
 
     def bullets(self, x, top, items, size=21, leading=27, gap=14, width=COL):
         """Items are (bold lead, first line, *continuation lines); returns the bottom."""
@@ -477,7 +480,7 @@ def support_matrix(s, x, top):
     rows = (
         ("PyTorch 2.14", "yes", "yes", "yes"),
         ("CUDA graph support", "yes", "yes", "wip"),
-        ("In-place input mutation*", "yes", "yes", "yes"),
+        ("In-place input mutation*", "yes", "yes", "wip"),
         ("Minimum CUDA", "12.4", "12.4", "12.8"),
         ("Inductor backend", "no", "no", "no"),
     )
@@ -589,9 +592,9 @@ def further_examples(s, x, top, size=150):
     s.picture("QR: further examples", QR_CODE, x, top, size, size, EXAMPLES_URL)
     left = x + size + 30
     width = x + COL - left
-    s.text("Further examples heading", left, top, "Further examples", 30, width, color=ORANGE, bold=True)
+    s.text("Further examples heading", left, top, "Full example source code", 30, width, color=ORANGE, bold=True)
     for index, (_, op, description) in enumerate(FURTHER_EXAMPLES):
-        runs = [s.run(f"{op:<8}", 21, MONO, ORANGE, bold=True), s.run(description, 21)]
+        runs = [s.run(f"{op:<13}", 21, MONO, ORANGE, bold=True), s.run(description, 21)]
         s.text(f"Further example {index + 1}", left, top + 42 + index * 27, runs, 21, width)
     link_top = top + 42 + len(FURTHER_EXAMPLES) * 27 + 4
     s.text("Further examples link", left, link_top, EXAMPLES_URL.removeprefix("https://"), 19, width,
@@ -614,17 +617,17 @@ def build_slide():
         "because that involved synchronizing with the host. Though CUDA graph "
         "conditional nodes can run data-dependent control flow fully on the GPU, "
         "they were not yet expressible via PyTorch. Users had to split their "
-        "workload into multiple CUDA graphs, which is intrusive and hard to maintain."
+        "workload into multiple CUDA graphs, which is intrusive, hard to maintain, and causes GPU idle bubbles."
     )
     present = (
         "Control flow expressed with torch.cond(), torch.while_loop(), or "
-        "torch.switch() can now be lowered to a CUDA graph. Outputs must keep "
+        "torch.switch() can now be lowered to a CUDA graph automatically. Outputs must keep "
         "a fixed shape across branches and loop iterations. Within that constraint, "
-        "data-dependent control flow is useful for real workloads, as the examples "
+        "data-dependent control flow is useful for several real workloads, as the examples "
         "here demonstrate."
     )
     for name, top, height, value, color in (
-        ("Past", row1, 238, past, MUTED),
+        ("Past", row1, 238, past, TEAL),
         ("Present", row1 + 254, 204, present, TEAL),
     ):
         paragraphs = [
@@ -640,11 +643,14 @@ def build_slide():
     bottom = s.code("Code: safe_sgd", SGD, XS[1], content1, 23, 30)
     s.text("Capture label", XS[1], bottom + 26, "Capture once, then replay:", 21, bold=True)
     bottom = s.code("Code: capture", CAPTURE, XS[1], bottom + 62, 21, 27)
-    s.text("Note: cond 1", XS[1], bottom + 28, "The predicate never leaves the GPU: no .item(), no CPU sync.", 21)
+    s.text("Note: cond 1", XS[1], bottom + 28, [s.run("The predicate ", 21), s.run("finite", 21, MONO),
+           s.run(" never leaves the GPU: no .item(), no CPU sync.", 21)], 21)
     s.text("Note: cond 2", XS[1], bottom + 60, "The same graph updates param or leaves it unchanged on each replay.", 21)
-    s.text("Note: cond 3", XS[1], bottom + 92, "Before: a Python if on this flag forces a CPU sync and breaks capture.", 21, color=MUTED)
+    s.text("Note: cond 3", XS[1], bottom + 92, [s.run("Before a Python if on the ", 21, color=MUTED),
+           s.run("finite", 21, MONO, MUTED),
+           s.run(" flag forces a CPU sync and breaks capture.", 21, color=MUTED)], 21)
 
-    s.heading(XS[2], row1, "", "The captured CUDA graph", "What safe_sgd becomes: one graph, GPU-side branch")
+    s.heading(XS[2], row1, "", "The captured CUDA graph", "What safe_sgd becomes: one graph, GPU-side branch, no CPU involvement", subline_size=19)
     cond_graph(s, XS[2], content1)
 
     # Column 1 runs through both rows, so the row rule starts at its divider.
@@ -664,7 +670,7 @@ def build_slide():
     motivation = (
         "Recommender system requests vary widely in token count, but each embedding "
         "bag returns a fixed-width vector. Select a token-count bucket on the GPU "
-        "and pad only to that bucket's capacity."
+        "and pad only to that bucket's capacity for efficiency."
     )
     s.textbox("Embedding motivation", x, content2, COL, 100,
               [[s.run(motivation, 23)]], 23, leading=29, wrap="square")
@@ -685,7 +691,6 @@ def build_slide():
     bottom = s.code("Code: MoE grouped GEMM", MOE_GEMM, x, bottom + 54, 19, 23)
     s.text("MoE loop heading", x, bottom + 20, "3. Repeat bounded all-to-all rounds on the GPU", 21, bold=True)
     bottom = s.code("Code: MoE while loop", MOE_LOOP, x, bottom + 54, 19, 23)
-    s.text("MoE excerpt note", x, bottom + 20, "Excerpts: routing, packing, returns, and capture helpers omitted.", 18, color=MUTED)
 
     s.rect("Divider", XS[2] - GAP / 2, row2, 1, 1700 - row2, RULE)
     return s
@@ -772,7 +777,7 @@ def verify_pdf(slide):
             raise ValueError(f"Highlight is not behind its code line: {line.strip()}")
 
     text = poppler("pdftotext", str(PDF), "-")
-    for required in ("torch.cond", "torch.while_loop", "grouped_mm", "ep8_moe", "Further examples", TITLE, *(a for author in AUTHORS for a in author)):
+    for required in ("torch.cond", "torch.while_loop", "grouped_mm", "ep8_moe", "Full example source code", TITLE, *(a for author in AUTHORS for a in author)):
         if required not in text:
             raise ValueError(f"Missing poster content: {required}")
     links = set(re.findall(rb"/URI\s*\(([^)]*)\)", PDF.read_bytes()))
