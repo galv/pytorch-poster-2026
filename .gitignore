@@ -2,3 +2,4 @@
 .poster-venv
 ~*
 *~
+__pycache__/

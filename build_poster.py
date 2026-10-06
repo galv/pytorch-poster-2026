@@ -26,8 +26,16 @@ EXAMPLES = HERE / "examples.py"
 TEMPLATE = ROOT / "PyTorch Conf NA 2026 Poster Template 36x24_horizontal (1).pptx"
 if not TEMPLATE.exists():
     TEMPLATE = HERE / "templates" / TEMPLATE.name
-PPTX = HERE / "poster.pptx"
-PDF = HERE / "poster.pdf"
+PPTX = HERE / "poster_rebuilt.pptx"
+PDF = HERE / "poster_rebuilt.pdf"
+QR_CODE = HERE / "examples_qr.png"
+EXAMPLES_URL = "https://ibm.biz/controlflow-in-cuda-graphs"  # Encoded in QR_CODE; redirects to examples.py.
+# (function in examples.py, control-flow op, one- or two-word description)
+FURTHER_EXAMPLES = (
+    ("safe_sgd", "cond", "optimizer skip"),
+    ("embedding_bag", "switch", "embedding buckets"),
+    ("moe_decode", "switch", "top-1 MoE"),
+)
 
 TITLE = "Shape-Stable Dynamic Control Flow in PyTorch CUDA Graphs"
 AUTHORS = (("Daniel Galvez", "NVIDIA"), ("Thomas Ortner", "IBM Research"))
@@ -135,6 +143,9 @@ def verify_code():
         shown = ast.parse(snippet).body[0]
         if ast.dump(shown) != ast.dump(functions[shown.name]):
             raise ValueError(f"Poster code differs from examples.py: {shown.name}")
+    for name, _, _ in FURTHER_EXAMPLES:
+        if name not in functions:
+            raise ValueError(f"Further example is not in examples.py: {name}")
     lines = {line.strip() for line in source.splitlines()}
     for snippet in (CAPTURE, SWITCH_IMPORT):
         for line in snippet.strip().splitlines():
@@ -193,6 +204,8 @@ class Slide:
         self.boxes = []
         # (code line, slot top, slot bottom) for each highlighted control-flow call.
         self.highlights = []
+        # Image files embedded in the slide; the n-th one is relationship rIdImage{n}.
+        self.images = []
 
     def next_id(self):
         return len(self.shapes) + 2
@@ -214,6 +227,19 @@ class Slide:
             f'<p:sp><p:nvSpPr><p:cNvPr id="{self.next_id()}" name="{escape(name)}"/>'
             f"<p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr>{xfrm(x, top, width, height)}"
             f"{geometry}{fill_xml(fill)}{line_xml(line, line_width)}</p:spPr>{text}</p:sp>"
+        )
+
+    def picture(self, name, path, x, top, width, height, url=None):
+        self.images.append(path)
+        link = ""
+        if url is not None:
+            self.links.append(url)
+            link = f'<a:hlinkClick r:id="rId{len(self.links) + 2}"/>'
+        self.shapes.append(
+            f'<p:pic><p:nvPicPr><p:cNvPr id="{self.next_id()}" name="{escape(name)}">{link}</p:cNvPr>'
+            '<p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>'
+            f'<p:blipFill><a:blip r:embed="rIdImage{len(self.images)}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>'
+            f'<p:spPr>{xfrm(x, top, width, height)}<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic>'
         )
 
     def rect(self, name, x, top, width, height, color):
@@ -430,6 +456,10 @@ class Slide:
             f'<Relationship Id="rId{index + 3}" Type="{base}/hyperlink" Target="{escape(url)}" TargetMode="External"/>'
             for index, url in enumerate(self.links)
         )
+        links += "".join(
+            f'<Relationship Id="rIdImage{index + 1}" Type="{base}/image" Target="../media/{path.name}"/>'
+            for index, path in enumerate(self.images)
+        )
         return (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
@@ -552,6 +582,22 @@ def switch_graph(s, x, top):
     s.text("SWITCH label", x + 26, frame_top + 140, "one body per expert; only body[expert] runs at replay", 17, COL - 52, "ctr", color=MUTED)
 
 
+def further_examples(s, x, top, size=150):
+    """QR code to examples.py, with a short list of the examples there."""
+    margin = 0.15 * size  # Quiet zone: at least 4 modules of the 29-module code.
+    s.rect("QR quiet zone", x - margin, top - margin, size + 2 * margin, size + 2 * margin, WHITE)
+    s.picture("QR: further examples", QR_CODE, x, top, size, size, EXAMPLES_URL)
+    left = x + size + 30
+    width = x + COL - left
+    s.text("Further examples heading", left, top, "Further examples", 30, width, color=ORANGE, bold=True)
+    for index, (_, op, description) in enumerate(FURTHER_EXAMPLES):
+        runs = [s.run(f"{op:<8}", 21, MONO, ORANGE, bold=True), s.run(description, 21)]
+        s.text(f"Further example {index + 1}", left, top + 42 + index * 27, runs, 21, width)
+    link_top = top + 42 + len(FURTHER_EXAMPLES) * 27 + 4
+    s.text("Further examples link", left, link_top, EXAMPLES_URL.removeprefix("https://"), 19, width,
+           color=BLUE, url=EXAMPLES_URL)
+
+
 def build_slide():
     s = Slide()
     s.title()
@@ -578,8 +624,8 @@ def build_slide():
         "here demonstrate."
     )
     for name, top, height, value, color in (
-        ("Past", row1, 310, past, MUTED),
-        ("Present", row1 + 336, 278, present, TEAL),
+        ("Past", row1, 238, past, MUTED),
+        ("Present", row1 + 254, 204, present, TEAL),
     ):
         paragraphs = [
             [s.run(name, 30, bold=True, color=color)],
@@ -588,6 +634,7 @@ def build_slide():
         s.textbox(name, XS[0], top, COL, height, paragraphs, 25,
                   leading=34, wrap="square")
         s.boxes.append((name, XS[0], top, XS[0] + COL, top + height))
+    further_examples(s, XS[0], 798)
 
     s.heading(XS[1], row1, "01", "Skip optimizer if gradient is non-finite", "torch.cond()  →  IF/ELSE conditional node")
     bottom = s.code("Code: safe_sgd", SGD, XS[1], content1, 23, 30)
@@ -600,9 +647,11 @@ def build_slide():
     s.heading(XS[2], row1, "", "The captured CUDA graph", "What safe_sgd becomes: one graph, GPU-side branch")
     cond_graph(s, XS[2], content1)
 
-    for x in XS[1:]:
-        s.rect("Divider", x - GAP / 2, row1, 1, 932 - row1, RULE)
-    s.rule(MARGIN, 952, width, TEAL, 2)
+    # Column 1 runs through both rows, so the row rule starts at its divider.
+    divider = XS[1] - GAP / 2
+    s.rect("Divider", divider, row1, 1, 1700 - row1, RULE)
+    s.rect("Divider", XS[2] - GAP / 2, row1, 1, 932 - row1, RULE)
+    s.rule(divider, 952, WIDTH - MARGIN - divider, TEAL, 2)
 
     # Row 2: support matrix, embedding bags, and lossless distributed MoE.
     row2, content2 = 972, 1058
@@ -638,8 +687,7 @@ def build_slide():
     bottom = s.code("Code: MoE while loop", MOE_LOOP, x, bottom + 54, 19, 23)
     s.text("MoE excerpt note", x, bottom + 20, "Excerpts: routing, packing, returns, and capture helpers omitted.", 18, color=MUTED)
 
-    for x in XS[1:]:
-        s.rect("Divider", x - GAP / 2, row2, 1, 1700 - row2, RULE)
+    s.rect("Divider", XS[2] - GAP / 2, row2, 1, 1700 - row2, RULE)
     return s
 
 
@@ -663,6 +711,8 @@ def write_pptx(slide):
                     data,
                 )
             dst.writestr(item, data)
+        for path in slide.images:
+            dst.write(path, f"ppt/media/{path.name}")
     print(f"PPTX: {PPTX}")
 
 
@@ -722,7 +772,7 @@ def verify_pdf(slide):
             raise ValueError(f"Highlight is not behind its code line: {line.strip()}")
 
     text = poppler("pdftotext", str(PDF), "-")
-    for required in ("torch.cond", "torch.while_loop", "grouped_mm", "ep8_moe", TITLE, *(a for author in AUTHORS for a in author)):
+    for required in ("torch.cond", "torch.while_loop", "grouped_mm", "ep8_moe", "Further examples", TITLE, *(a for author in AUTHORS for a in author)):
         if required not in text:
             raise ValueError(f"Missing poster content: {required}")
     links = set(re.findall(rb"/URI\s*\(([^)]*)\)", PDF.read_bytes()))
@@ -739,7 +789,7 @@ def verify_pdf(slide):
 def main():
     global PPTX, PDF
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-stem", default="poster", help="Output basename, without extension")
+    parser.add_argument("--output-stem", default=PPTX.stem, help="Output basename, without extension")
     args = parser.parse_args()
     if Path(args.output_stem).name != args.output_stem or args.output_stem in ("", ".", ".."):
         parser.error("--output-stem must be a basename without directories")
